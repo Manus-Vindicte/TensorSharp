@@ -1,0 +1,140 @@
+name: Cross-engine benchmark
+
+# Drives benchmarks/cross_engine: TensorSharp vs llama.cpp vs vLLM across text,
+# multimodal, multi-turn, function-call and diffusion scenarios on GPU/CPU.
+#
+# Manual only (workflow_dispatch). This runs real GGUF/HF models on real GPUs,
+# which github-hosted runners do not provide, so it targets a self-hosted runner.
+#
+# The runner is expected to have:
+#   - .NET 10 SDK on PATH (to build TensorSharp.Cli)
+#   - Python 3.9+ (stdlib only; the harness needs no pip packages)
+#   - llama.cpp binaries (llama-bench/llama-cli/llama-mtmd-cli) and, optionally,
+#     a running llama-server for multi-turn/function-call
+#   - vLLM available (server reachable at the configured base_url, or launchable)
+#   - The model directory + media files populated at the configured paths
+#   - benchmarks/cross_engine/config.json present on the runner (machine-specific
+#     paths/endpoints; not committed). Provide it via the CROSS_ENGINE_CONFIG
+#     repo variable/secret or place it on the runner out of band.
+
+on:
+  workflow_dispatch:
+    inputs:
+      engines:
+        description: "Engines (comma-separated): tensorsharp,llamacpp,vllm"
+        required: false
+        default: "tensorsharp,llamacpp,vllm"
+      backends:
+        description: "Backends (comma-separated): gpu,cpu"
+        required: false
+        default: "gpu,cpu"
+      models:
+        description: "Model ids: gemma4,qwen36,diffusiongemma"
+        required: false
+        default: "gemma4,qwen36,diffusiongemma"
+      tasks:
+        description: "Task ids (empty = all)"
+        required: false
+        default: ""
+      quick:
+        description: "Quick smoke profile (smaller token counts)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: cross-engine-benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: Cross-engine matrix
+    runs-on: [self-hosted, tensorsharp-cuda]
+    timeout-minutes: 480
+    env:
+      CROSS_ENGINE_DIR: benchmarks/cross_engine
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show toolchain
+        run: |
+          dotnet --info || true
+          python3 --version || true
+          (which nvidia-smi >/dev/null 2>&1 && nvidia-smi) || true
+
+      - name: Build TensorSharp CLI (Release)
+        run: dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release
+
+      - name: Materialize config.json
+        env:
+          CROSS_ENGINE_CONFIG: ${{ secrets.CROSS_ENGINE_CONFIG || vars.CROSS_ENGINE_CONFIG }}
+        run: |
+          set -euo pipefail
+          if [ -f "$CROSS_ENGINE_DIR/config.json" ]; then
+            echo "Using config.json already present on the runner."
+          elif [ -n "${CROSS_ENGINE_CONFIG:-}" ]; then
+            echo "Writing config.json from CROSS_ENGINE_CONFIG."
+            printf '%s' "$CROSS_ENGINE_CONFIG" > "$CROSS_ENGINE_DIR/config.json"
+          else
+            echo "No config.json found and CROSS_ENGINE_CONFIG not set." >&2
+            echo "Provide one (see benchmarks/cross_engine/README.md)." >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os
+          p = os.path.join(os.environ["CROSS_ENGINE_DIR"], "config.json")
+          json.load(open(p))
+          print("config.json parsed OK")
+          PY
+
+      - name: Run benchmark matrix
+        env:
+          IN_ENGINES: ${{ github.event.inputs.engines }}
+          IN_BACKENDS: ${{ github.event.inputs.backends }}
+          IN_MODELS: ${{ github.event.inputs.models }}
+          IN_TASKS: ${{ github.event.inputs.tasks }}
+          IN_QUICK: ${{ github.event.inputs.quick }}
+        run: |
+          set -euo pipefail
+          cd "$CROSS_ENGINE_DIR"
+          ARGS=(--skip-existing)
+          [ -n "${IN_ENGINES:-}" ]  && ARGS+=(--engines  "$IN_ENGINES")
+          [ -n "${IN_BACKENDS:-}" ] && ARGS+=(--backends "$IN_BACKENDS")
+          [ -n "${IN_MODELS:-}" ]   && ARGS+=(--models   "$IN_MODELS")
+          [ -n "${IN_TASKS:-}" ]    && ARGS+=(--tasks    "$IN_TASKS")
+          [ "${IN_QUICK:-false}" = "true" ] && ARGS+=(--quick)
+          echo "args: ${ARGS[*]}"
+          python3 scripts/run_benchmark.py "${ARGS[@]}"
+
+      - name: Build report
+        if: always()
+        run: |
+          cd "$CROSS_ENGINE_DIR"
+          python3 scripts/build_report.py
+
+      - name: Upload per-cell JSON results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-engine-results
+          path: benchmarks/cross_engine/results
+          retention-days: 30
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-engine-report
+          path: benchmarks/cross_engine/REPORT.md
+          retention-days: 90
+
+      - name: Render report into job summary
+        if: always()
+        run: |
+          if [ -f "$CROSS_ENGINE_DIR/REPORT.md" ]; then
+            head -c 900000 "$CROSS_ENGINE_DIR/REPORT.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "(no report produced)" >> "$GITHUB_STEP_SUMMARY"
+          fi

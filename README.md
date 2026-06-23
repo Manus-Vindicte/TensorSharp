@@ -269,7 +269,8 @@ TensorSharp/
 │   ├── env_var_feature_matrix.md  # Runtime flag × model/backend/feature coverage for TestMatrix
 │   └── inference_benchmark_matrix.md  # Cross-engine throughput matrix (TensorSharp vs llama.cpp vs Ollama)
 ├── benchmarks/                  # Reproducible benchmark harnesses
-│   └── inference_matrix/        # Driver scripts, modelfiles, prompts, and per-cell raw JSON results
+│   ├── inference_matrix/        # Captured snapshot: TensorSharp vs llama.cpp vs Ollama (Gemma 4, Apple Silicon)
+│   └── cross_engine/            # Configurable automation: TensorSharp vs llama.cpp vs vLLM across models/scenarios/backends
 └── ExternalProjects/            # ggml/ is cloned from github.com/ggml-org/ggml at build time (not committed)
 ```
 

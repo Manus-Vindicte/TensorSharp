@@ -44,6 +44,15 @@ ScaffoldingReadMe.txt
 *~
 CodeCoverage/
 
+# Cross-engine benchmark: local config + generated artifacts
+benchmarks/cross_engine/config.json
+benchmarks/cross_engine/results/
+benchmarks/cross_engine/REPORT.md
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+
 # MSBuild Binary and Structured Log
 *.binlog
 

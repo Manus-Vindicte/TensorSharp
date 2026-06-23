@@ -1,0 +1,79 @@
+{
+  "_comment": [
+    "Cross-engine benchmark configuration. Copy this file to config.json and edit",
+    "the paths / endpoints for your machine. config.json is git-ignored.",
+    "String values support {repo_root}, {model_dir} and {data_dir} placeholders.",
+    "Anything you do not have installed can be left as-is; the driver auto-skips",
+    "engine x backend x model x task cells that cannot run and records the reason."
+  ],
+
+  "repo_root": "/home/user/TensorSharp",
+  "model_dir": "/models",
+  "data_dir": "{repo_root}/data",
+
+  "engines": {
+    "tensorsharp": {
+      "bin": "{repo_root}/TensorSharp.Cli/bin/Release/TensorSharp.Cli",
+      "backends": { "gpu": "ggml_cuda", "cpu": "ggml_cpu" }
+    },
+    "llamacpp": {
+      "bin_dir": "/usr/local/bin",
+      "backends": { "gpu": 999, "cpu": 0 }
+    },
+    "vllm": {
+      "base_url": "http://localhost:8000",
+      "api_key": "EMPTY",
+      "backends": { "gpu": "cuda", "cpu": "cpu" },
+      "_comment": "vLLM serves one model per server process. Start the server yourself (see README) and point base_url at it, or set launch=true with a launch_cmd template per model.",
+      "launch": false,
+      "launch_cmd": "vllm serve {hf_id} --served-model-name {served_name} --port 8000 --device {device}",
+      "startup_timeout_s": 600
+    }
+  },
+
+  "media": {
+    "image": "{data_dir}/apple.png",
+    "audio": "{data_dir}/obama_first_45_secs.mp3",
+    "video": "{data_dir}/concert.mp4"
+  },
+
+  "models": {
+    "gemma4": {
+      "display": "Gemma 4 E4B (Q8_0)",
+      "family": "gemma4",
+      "gguf": "{model_dir}/gemma-4-E4B-it-Q8_0.gguf",
+      "mmproj": "{model_dir}/gemma-4-mmproj-F16.gguf",
+      "hf_id": "google/gemma-4-E4B-it",
+      "vllm_served_name": "gemma4",
+      "modalities": ["text", "image", "audio", "video"],
+      "supports_tools": true,
+      "supports_thinking": true,
+      "diffusion": false
+    },
+    "qwen36": {
+      "display": "Qwen3.6 35B-A3B (UD-IQ2_XXS, MoE)",
+      "family": "qwen35",
+      "gguf": "{model_dir}/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf",
+      "mmproj": null,
+      "hf_id": "Qwen/Qwen3.6-35B-A3B",
+      "vllm_served_name": "qwen36",
+      "modalities": ["text", "image"],
+      "supports_tools": true,
+      "supports_thinking": true,
+      "diffusion": false
+    },
+    "diffusiongemma": {
+      "display": "DiffusionGemma (text-diffusion)",
+      "family": "diffusion-gemma",
+      "gguf": "{model_dir}/diffusion-gemma-Q8_0.gguf",
+      "mmproj": null,
+      "hf_id": null,
+      "vllm_served_name": null,
+      "modalities": ["text"],
+      "supports_tools": false,
+      "supports_thinking": false,
+      "diffusion": true,
+      "diffusion_steps": 48
+    }
+  }
+}
