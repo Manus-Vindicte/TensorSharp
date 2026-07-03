@@ -314,38 +314,24 @@ namespace TensorSharp.Runtime
 
         private static StructuredOutputNormalizationResult NormalizeJsonObject(string rawOutput)
         {
-            if (!TryExtractJsonObject(rawOutput, out string? candidateJson, out string? extractError))
+            if (TryExtractJsonObject(rawOutput, out string? candidateJson, out _))
             {
-                return new StructuredOutputNormalizationResult
-                {
-                    Errors = new List<string> { extractError }
-                };
-            }
-
-            try
-            {
-                using var doc = JsonDocument.Parse(candidateJson);
-                if (doc.RootElement.ValueKind != JsonValueKind.Object)
-                {
-                    return new StructuredOutputNormalizationResult
-                    {
-                        Errors = new List<string> { "response_format.type=json_object requires the model to return a JSON object." }
-                    };
-                }
-
                 return new StructuredOutputNormalizationResult
                 {
                     IsValid = true,
-                    NormalizedContent = JsonSerializer.Serialize(doc.RootElement)
+                    NormalizedContent = candidateJson
                 };
             }
-            catch (Exception ex)
+
+            // json_object mode guarantees the client always receives parseable
+            // JSON: when the model produced no recoverable JSON object at all,
+            // wrap the raw text in a well-formed envelope instead of failing.
+            return new StructuredOutputNormalizationResult
             {
-                return new StructuredOutputNormalizationResult
-                {
-                    Errors = new List<string> { "The model response could not be parsed as JSON: " + ex.Message }
-                };
-            }
+                IsValid = true,
+                NormalizedContent = JsonSerializer.Serialize(
+                    new Dictionary<string, string> { ["response"] = rawOutput.Trim() })
+            };
         }
 
         private static void ValidateSchemaNode(JsonElement schema, string path, int depth,
@@ -937,9 +923,31 @@ namespace TensorSharp.Runtime
                     return true;
             }
 
+            // Last resort: run the streaming repairer over the whole output. It
+            // fixes what strict parsing cannot (truncated objects, single quotes,
+            // unquoted keys, Python literals, missing commas/colons, unescaped
+            // control characters) and always yields a parseable object once an
+            // opening '{' was seen.
+            var repairer = new StreamingJsonObjectRepairer();
+            string repaired = repairer.Feed(trimmed);
+            if (repairer.Started)
+            {
+                repaired += repairer.Finish();
+                if (TryParseCandidate(repaired, out json))
+                    return true;
+            }
+
             error = "The model response did not contain a valid JSON object.";
             return false;
         }
+
+        // Trailing commas and comments are common in LLM output; tolerate them
+        // when parsing candidates (the re-serialized result is always strict JSON).
+        private static readonly JsonDocumentOptions LenientParseOptions = new()
+        {
+            AllowTrailingCommas = true,
+            CommentHandling = JsonCommentHandling.Skip
+        };
 
         private static bool TryParseCandidate(string candidate, [NotNullWhen(true)] out string? json)
         {
@@ -949,7 +957,7 @@ namespace TensorSharp.Runtime
 
             try
             {
-                using var doc = JsonDocument.Parse(candidate);
+                using var doc = JsonDocument.Parse(candidate, LenientParseOptions);
                 if (doc.RootElement.ValueKind != JsonValueKind.Object)
                     return false;
                 json = JsonSerializer.Serialize(doc.RootElement);

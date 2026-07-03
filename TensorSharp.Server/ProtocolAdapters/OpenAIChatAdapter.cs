@@ -259,12 +259,13 @@ namespace TensorSharp.Server.ProtocolAdapters
             }
 
             // json_object streams incrementally: strip code fences / leading prose /
-            // stray tags and keep only the balanced JSON object, matching the clean
-            // shape the buffered non-streaming path emits. (json_schema still buffers
-            // and schema-normalizes via bufferForStructured.)
+            // stray tags, repair malformed JSON on the fly, and close the object at
+            // end-of-stream so the concatenated chunks are always parseable JSON —
+            // matching the clean shape the buffered non-streaming path emits.
+            // (json_schema still buffers and schema-normalizes via bufferForStructured.)
             var jsonObjectFilter = (!bufferForStructured && responseFormat != null
                 && responseFormat.Kind == StructuredOutputKind.JsonObject)
-                ? new StreamingJsonObjectFilter() : null;
+                ? new StreamingJsonObjectRepairer() : null;
 
             await foreach (var (piece, done, promptTokens, evalTokens, kvReusedTokens, totalNs, promptNs, evalNs)
                 in _svc.ChatStreamWithMetricsAsync(inferenceMessages, maxTokens, ctx.RequestAborted, samplingConfig,
@@ -365,6 +366,8 @@ namespace TensorSharp.Server.ProtocolAdapters
                                 ctx.RequestAborted);
                     }
 
+                    await EmitJsonObjectTailAsync(ctx, requestId, jsonObjectFilter);
+
                     string finReason = sawToolCall ? "tool_calls" : "stop";
                     await SseWriter.WriteEventAsync(ctx.Response,
                         OpenAIResponseFactory.EndChunk(requestId, _svc.LoadedModelName, finReason, promptTokens, evalTokens, kvReusedTokens),
@@ -372,6 +375,8 @@ namespace TensorSharp.Server.ProtocolAdapters
                 }
                 else
                 {
+                    await EmitJsonObjectTailAsync(ctx, requestId, jsonObjectFilter);
+
                     await SseWriter.WriteEventAsync(ctx.Response,
                         OpenAIResponseFactory.EndChunk(requestId, _svc.LoadedModelName, "stop", promptTokens, evalTokens, kvReusedTokens),
                         ctx.RequestAborted);
@@ -380,6 +385,29 @@ namespace TensorSharp.Server.ProtocolAdapters
                 await SseWriter.WriteDoneSentinelAsync(ctx.Response, ctx.RequestAborted);
                 await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
             }
+        }
+
+        /// <summary>
+        /// Flushes the json_object streaming repairer at end-of-stream: emits the
+        /// closing suffix that makes the streamed chunks a complete, parseable
+        /// JSON object (or a whole fallback object when the model produced no
+        /// JSON at all).
+        /// </summary>
+        private async Task EmitJsonObjectTailAsync(
+            HttpContext ctx,
+            string requestId,
+            StreamingJsonObjectRepairer jsonObjectFilter)
+        {
+            if (jsonObjectFilter == null)
+                return;
+
+            string jsonTail = jsonObjectFilter.Finish();
+            if (string.IsNullOrEmpty(jsonTail))
+                return;
+
+            await SseWriter.WriteEventAsync(ctx.Response,
+                OpenAIResponseFactory.ContentChunk(requestId, _svc.LoadedModelName, jsonTail),
+                ctx.RequestAborted);
         }
 
         private async Task<bool> FlushStructuredCompletionAsync(
@@ -477,7 +505,19 @@ namespace TensorSharp.Server.ProtocolAdapters
 
             if (responseFormat != null)
             {
-                var normalized = StructuredOutputValidator.NormalizeOutput(rawOutput, responseFormat);
+                // Architectures with channel markup (e.g. gpt-oss) must run the
+                // output parser first so the JSON is extracted from the final
+                // channel rather than from reasoning text — same as the buffered
+                // streaming path in FlushStructuredCompletionAsync.
+                string structuredRaw = rawOutput;
+                if (useParser)
+                {
+                    var structParser = OutputParserFactory.Create(_svc.Architecture);
+                    structParser.Init(openaiThink, openaiTools);
+                    structuredRaw = structParser.Add(rawOutput, true).Content ?? "";
+                }
+
+                var normalized = StructuredOutputValidator.NormalizeOutput(structuredRaw, responseFormat);
                 if (!normalized.IsValid)
                 {
                     ctx.Response.StatusCode = 422;

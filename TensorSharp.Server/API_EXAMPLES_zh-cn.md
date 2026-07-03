@@ -831,7 +831,8 @@ print()
 
 - `response_format.type = "json_schema"` 当前不能与 `tools` 或 `think` 同时使用。
 - 流式 `json_object` 请求会逐 token 流式返回 JSON 对象（自动剥离 Markdown 代码围栏和多余标签），因此首 token 时延（TTFT）反映的是 prefill 延迟。流式 `json_schema`（strict）请求仍会先在服务端缓存并按 schema 归一化，再以单个 chunk 发出。设置 `TS_STRUCTURED_STREAM_BUFFER=1` 可对两者强制使用旧的“全部缓存”行为。非流式请求始终归一化。
-- 非法 schema 返回 HTTP `400`；非流式 / `json_schema` 输出未能通过校验则返回 HTTP `422`（已经开始的 `json_object` 流无法再更改状态码）。
+- `json_object` 响应保证是可解析的 JSON。畸形的模型输出会被实时修复（截断的对象自动补全闭合、单引号和未加引号的键会被改写、Python 风格的 `True`/`False`/`None` 字面量会被转换、尾随逗号会被删除、缺失的逗号/冒号会被补上、字符串内的原始控制字符会被转义）。如果模型完全没有输出 JSON 对象，原始文本会被包装为 `{"response": "<文本>"}`（空输出返回 `{}`），因此 JSON 解析器始终能成功解析返回内容。
+- `json_schema` 输出提取在 schema 归一化之前会执行同样的修复流程，因此被截断但信息足够完整的响应仍能通过校验。非法 schema 返回 HTTP `400`；仍未通过 schema 校验的 `json_schema` 输出返回 HTTP `422`（错误体为 JSON）。
 
 ---
 

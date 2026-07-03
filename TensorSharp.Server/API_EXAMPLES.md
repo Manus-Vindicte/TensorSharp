@@ -838,7 +838,8 @@ Notes:
 
 - `response_format.type = "json_schema"` currently cannot be combined with `tools` or `think`.
 - Streaming `json_object` requests stream the JSON object token-by-token (code fences and stray tags are stripped on the fly), so time-to-first-token reflects prefill latency. Streaming `json_schema` (strict) requests are still buffered and schema-normalized before the single chunk is emitted. Set `TS_STRUCTURED_STREAM_BUFFER=1` to force the legacy buffer-everything behavior for both. Non-streaming requests are always normalized.
-- Invalid schemas return HTTP `400`; non-streaming / `json_schema` responses that still fail validation return HTTP `422` (a `json_object` stream that has already started cannot change its status code).
+- `json_object` responses are guaranteed to be parseable JSON. Malformed model output is repaired on the fly (truncated objects are closed, single quotes and unquoted keys are rewritten, Python-style `True`/`False`/`None` literals are converted, trailing commas are dropped, missing commas/colons are inserted, and raw control characters inside strings are escaped). If the model produces no JSON object at all, the raw text is wrapped as `{"response": "<text>"}` (an empty stream yields `{}`), so a JSON parser always succeeds on the returned content.
+- `json_schema` output extraction uses the same repair pass before schema normalization, so truncated-but-complete-enough responses still validate. Invalid schemas return HTTP `400`; `json_schema` responses that still fail schema validation return HTTP `422` with a JSON error body.
 
 ---
 

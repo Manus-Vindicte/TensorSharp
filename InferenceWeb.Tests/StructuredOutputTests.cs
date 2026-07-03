@@ -1,19 +1,20 @@
 ﻿using System.Text;
 using System.Text.Json;
-using TensorSharp.Server.StreamingWriters;
 
 namespace InferenceWeb.Tests;
 
 public class StructuredOutputTests
 {
     // Stream a model output in many small fragments through the json_object
-    // streaming filter and return the concatenation actually sent to the client.
+    // streaming repairer and return the concatenation actually sent to the
+    // client, including the end-of-stream closing suffix.
     private static string FeedInChunks(string modelOutput, int chunkSize = 3)
     {
-        var filter = new StreamingJsonObjectFilter();
+        var filter = new StreamingJsonObjectRepairer();
         var sb = new StringBuilder();
         for (int i = 0; i < modelOutput.Length; i += chunkSize)
             sb.Append(filter.Feed(modelOutput.Substring(i, System.Math.Min(chunkSize, modelOutput.Length - i))));
+        sb.Append(filter.Finish());
         return sb.ToString();
     }
 
@@ -45,11 +46,148 @@ public class StructuredOutputTests
     [Fact]
     public void StreamingJsonFilterStopsAtFirstBalancedObject()
     {
-        var filter = new StreamingJsonObjectFilter();
+        var filter = new StreamingJsonObjectRepairer();
         string emitted = filter.Feed("{\"a\":1}{\"b\":2}");
         Assert.Equal("""{"a":1}""", emitted);
         Assert.True(filter.Done);
         Assert.Equal("", filter.Feed("more text")); // nothing after close
+        Assert.Equal("", filter.Finish());          // nothing left to close
+    }
+
+    [Fact]
+    public void StreamingJsonRepairerClosesTruncatedOutput()
+    {
+        // max_tokens hit in the middle of a string value
+        string streamed = FeedInChunks("{\"name\": \"Ma");
+
+        Assert.Equal("""{"name": "Ma"}""", streamed);
+        using var doc = JsonDocument.Parse(streamed);
+        Assert.Equal("Ma", doc.RootElement.GetProperty("name").GetString());
+    }
+
+    [Fact]
+    public void StreamingJsonRepairerCompletesDanglingKeysValuesAndLiterals()
+    {
+        // truncated right after a key
+        Assert.Equal("""{"a":null}""", FeedInChunks("{\"a\""));
+        // truncated right after the colon
+        Assert.Equal("""{"a": null}""", FeedInChunks("{\"a\": "));
+        // truncated inside a literal and inside a nested array
+        string streamed = FeedInChunks("{\"items\": [1, 2, {\"ok\": tru");
+        Assert.Equal("""{"items": [1, 2, {"ok": true}]}""", streamed);
+        JsonDocument.Parse(streamed).Dispose();
+        // truncated number
+        Assert.Equal("""{"n": 12.0}""", FeedInChunks("{\"n\": 12."));
+    }
+
+    [Fact]
+    public void StreamingJsonRepairerFixesSingleQuotesUnquotedKeysAndPythonLiterals()
+    {
+        string streamed = FeedInChunks("{name: 'Mars', ok: True, note: None, bad: NaN}", chunkSize: 1);
+
+        using var doc = JsonDocument.Parse(streamed);
+        Assert.Equal("Mars", doc.RootElement.GetProperty("name").GetString());
+        Assert.True(doc.RootElement.GetProperty("ok").GetBoolean());
+        Assert.Equal(JsonValueKind.Null, doc.RootElement.GetProperty("note").ValueKind);
+        Assert.Equal(JsonValueKind.Null, doc.RootElement.GetProperty("bad").ValueKind);
+    }
+
+    [Fact]
+    public void StreamingJsonRepairerDropsTrailingCommasAndInsertsMissingOnes()
+    {
+        string trailing = FeedInChunks("{\"a\": [1, 2,], \"b\": 2,}");
+        using (var doc = JsonDocument.Parse(trailing))
+            Assert.Equal(2, doc.RootElement.GetProperty("a").GetArrayLength());
+
+        string missing = FeedInChunks("{\"a\": 1 \"b\": 2}");
+        using (var doc = JsonDocument.Parse(missing))
+            Assert.Equal(2, doc.RootElement.GetProperty("b").GetInt32());
+    }
+
+    [Fact]
+    public void StreamingJsonRepairerEscapesRawControlCharactersInStrings()
+    {
+        string streamed = FeedInChunks("{\"text\": \"line1\nline2\"}");
+
+        using var doc = JsonDocument.Parse(streamed);
+        Assert.Equal("line1\nline2", doc.RootElement.GetProperty("text").GetString());
+    }
+
+    [Fact]
+    public void StreamingJsonRepairerFallsBackToWrappedProseOrEmptyObject()
+    {
+        string wrapped = FeedInChunks("I cannot answer that.");
+        using (var doc = JsonDocument.Parse(wrapped))
+            Assert.Equal("I cannot answer that.", doc.RootElement.GetProperty("response").GetString());
+
+        var filter = new StreamingJsonObjectRepairer();
+        Assert.Equal("{}", filter.Finish());
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(5)]
+    [InlineData(7)]
+    [InlineData(64)]
+    public void StreamingJsonRepairerAlwaysYieldsParseableJsonRegardlessOfChunking(int chunkSize)
+    {
+        string[] nastyOutputs =
+        {
+            "```json\n{\"a\": [1, 2, {\"b\": 'x'}],}\n``` Done!",
+            "{\"a\": \"unterminated",
+            "{\"k\": +012.50, \"e\": 1e}",
+            "{\"nested\": {\"deep\": [true, False, None, NaN",
+            "{'single': 'quotes', \"mix\": \"double\"}",
+            "{\"a\"",
+            "{\"a\":}",
+            "{\"a\": \"b} c\", \"d\": 2}",
+            "<|channel|>final {\"x\": 1}<|end|>",
+            "{\"a\" 1, \"b\":2}",
+            "{\"a\": \"x\" \"y\": 2}",
+            "{\"esc\": \"bad \\q escape\", \"u\": \"\\u12ZZ\"}",
+            "{\"a\": [1, [2, {\"b\": [3",
+            "{,}",
+            "{\"a\": hello world}",
+        };
+
+        foreach (string raw in nastyOutputs)
+        {
+            string streamed = FeedInChunks(raw, chunkSize);
+            using var doc = JsonDocument.Parse(streamed);
+            Assert.Equal(JsonValueKind.Object, doc.RootElement.ValueKind);
+        }
+    }
+
+    [Fact]
+    public void StreamingJsonRepairerSurvivesRandomizedFuzzInput()
+    {
+        // Deterministic pseudo-fuzz: random JSON-ish garbage must still come out
+        // as exactly one parseable JSON object, no matter how it is chunked.
+        var rng = new System.Random(20260703);
+        const string alphabet = "{}[]\":',.\\ \t\n0123456789eE+-truefalsnTFNIxé中";
+
+        for (int iteration = 0; iteration < 2000; iteration++)
+        {
+            int length = rng.Next(0, 120);
+            var raw = new StringBuilder(length);
+            for (int i = 0; i < length; i++)
+                raw.Append(alphabet[rng.Next(alphabet.Length)]);
+
+            string input = raw.ToString();
+            string streamed = FeedInChunks(input, chunkSize: rng.Next(1, 9));
+
+            try
+            {
+                using var doc = JsonDocument.Parse(streamed);
+                Assert.Equal(JsonValueKind.Object, doc.RootElement.ValueKind);
+            }
+            catch (JsonException ex)
+            {
+                Assert.Fail($"Iteration {iteration} produced unparseable JSON.\nInput: {input}\nOutput: {streamed}\nError: {ex.Message}");
+            }
+        }
     }
 
 
@@ -197,6 +335,57 @@ public class StructuredOutputTests
           "answer": "ok"
         }
         """, format);
+
+        Assert.True(normalized.IsValid, normalized.ErrorMessage);
+        Assert.Equal("""{"answer":"ok","optional_note":null,"done":true}""", normalized.NormalizedContent);
+    }
+
+    [Fact]
+    public void JsonObjectNormalizationRepairsMalformedJson()
+    {
+        var normalized = StructuredOutputValidator.NormalizeOutput(
+            "Sure! {'answer': 'forty-two', count: 42, valid: True,}",
+            StructuredOutputFormat.JsonObject());
+
+        Assert.True(normalized.IsValid, normalized.ErrorMessage);
+        using var doc = JsonDocument.Parse(normalized.NormalizedContent);
+        Assert.Equal("forty-two", doc.RootElement.GetProperty("answer").GetString());
+        Assert.Equal(42, doc.RootElement.GetProperty("count").GetInt32());
+        Assert.True(doc.RootElement.GetProperty("valid").GetBoolean());
+    }
+
+    [Fact]
+    public void JsonObjectNormalizationWrapsPlainTextAsJson()
+    {
+        var normalized = StructuredOutputValidator.NormalizeOutput(
+            "Sorry, I can only answer in prose.",
+            StructuredOutputFormat.JsonObject());
+
+        Assert.True(normalized.IsValid, normalized.ErrorMessage);
+        using var doc = JsonDocument.Parse(normalized.NormalizedContent);
+        Assert.Equal("Sorry, I can only answer in prose.",
+            doc.RootElement.GetProperty("response").GetString());
+    }
+
+    [Fact]
+    public void JsonSchemaNormalizationRepairsTruncatedOutput()
+    {
+        var format = StructuredOutputFormat.JsonSchema("result", """
+        {
+          "type": "object",
+          "properties": {
+            "answer": { "type": "string" },
+            "optional_note": { "type": ["string", "null"] },
+            "done": { "type": "boolean" }
+          },
+          "required": ["answer", "optional_note", "done"],
+          "additionalProperties": false
+        }
+        """);
+
+        // output cut off by max_tokens before the closing brace
+        var normalized = StructuredOutputValidator.NormalizeOutput(
+            "{\"done\": true, \"answer\": \"ok\"", format);
 
         Assert.True(normalized.IsValid, normalized.ErrorMessage);
         Assert.Equal("""{"answer":"ok","optional_note":null,"done":true}""", normalized.NormalizedContent);
